@@ -1,0 +1,158 @@
+# 入口
+┌─────────────────────────────────────────────────────────────────────┐
+│                         GraphRAG 类                                  │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  insert(string_or_strings)                                          │
+│    └─→ always_get_an_event_loop()          [utils.py]               │
+│        └─→ self.ainsert(string_or_strings)                          │
+│                                                                     │
+│  query(query, param)                                                │
+│    └─→ always_get_an_event_loop()          [utils.py]               │
+│        └─→ self.aquery(query, param)                                │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+# 构造graph
+GraphRAG.ainsert(string_or_strings)
+│
+├── [1] self._insert_start()
+│     └─→ asyncio.gather(*[storage.index_start_callback()])
+│           └─→ NetworkXStorage.index_start_callback()    [base.py]
+│
+├── [2] 文档预处理
+│     ├─→ compute_mdhash_id()              [utils.py]  ← 生成文档唯一ID
+│     └─→ self.full_docs.filter_keys()     [base.py]   ← 去重
+│           └─→ JsonKVStorage.filter_keys()
+│
+├── [3] 文本切分
+│     └─→ get_chunks()                     [graphrag.py]
+│           ├─→ tokenizer_wrapper.encode()  [utils.py]  ← 编码为token
+│           ├─→ chunk_by_token_size()       [graphrag.py]
+│           │     └─→ tokenizer_wrapper.decode_batch()  [utils.py] ← 解码回文本
+│           └─→ compute_mdhash_id()         [utils.py]  ← 生成chunk唯一ID
+│
+├── [4] 实体提取（调用LLM）
+│     └─→ self.entity_extraction_func()    → extract_entities()  [utils.py]
+│           │
+│           ├── 对每个chunk并行处理:
+│           │   └─→ _process_single_content()  [utils.py 内部函数]
+│           │         ├─→ use_llm_func(hint_prompt)  → best_model_func()  [llm.py]
+│           │         │     └─→ openai_complete_if_cache() / ollama_model_if_cache()
+│           │         │           ├─→ compute_args_hash()          [utils.py] ← 缓存查找
+│           │         │           └─→ hashing_kv.get_by_id()       [base.py]
+│           │         │
+│           │         ├─→ pack_user_ass_to_openai_messages()       [utils.py]
+│           │         │
+│           │         ├─→ use_llm_func(continue_prompt)  ← gleaning循环
+│           │         └─→ use_llm_func(if_loop_prompt)   ← 判断是否继续
+│           │
+│           ├── 解析LLM返回的文本记录:
+│           │   ├─→ split_string_by_multi_markers()    [utils.py]
+│           │   ├─→ _handle_single_entity_extraction() [utils.py] ← 解析实体
+│           │   │     └─→ clean_str()                  [utils.py]
+│           │   └─→ _handle_single_relationship_extraction() [utils.py] ← 解析关系
+│           │         └─→ is_float_regex()             [utils.py]
+│           │
+│           ├── 合并实体节点:
+│           │   └─→ _merge_nodes_then_upsert()         [utils.py]
+│           │         ├─→ knowledge_graph_inst.get_node()      [base.py]
+│           │         ├─→ split_string_by_multi_markers()      [utils.py]
+│           │         ├─→ _handle_entity_relation_summary()    [utils.py] ← 摘要
+│           │         │     └─→ cheap_model_func()             [llm.py]
+│           │         └─→ knowledge_graph_inst.upsert_node()   [base.py]
+│           │
+│           ├── 合并关系边:
+│           │   └─→ _merge_edges_then_upsert()         [utils.py]
+│           │         ├─→ knowledge_graph_inst.has_edge()      [base.py]
+│           │         ├─→ knowledge_graph_inst.upsert_node()   [base.py]
+│           │         ├─→ _handle_entity_relation_summary()    [utils.py]
+│           │         └─→ knowledge_graph_inst.upsert_edge()   [base.py]
+│           │
+│           └── 写入实体向量库:
+│                 └─→ entity_vdb.upsert()   → VectorDBStorage.upsert() [base.py]
+│                       └─→ embedding_func()  [llm.py]
+│
+├── [5] 图聚类
+│     └─→ self.chunk_entity_relation_graph.clustering()  [base.py]
+│           └─→ NetworkXStorage._leiden_clustering()
+│
+├── [6] 社区报告生成
+│     └─→ generate_community_report()          [graphrag.py]
+│           ├─→ knowledge_graph_inst.community_schema()  [base.py]
+│           │
+│           └── 按level从高到低逐层生成:
+│                 └─→ _form_single_community_report()    [graphrag.py 内部函数]
+│                       ├─→ _pack_single_community_describe()  [graphrag.py]
+│                       │     ├─→ knowledge_graph_inst.get_node()     [base.py]
+│                       │     ├─→ knowledge_graph_inst.get_edge()     [base.py]
+│                       │     ├─→ knowledge_graph_inst.node_degrees_batch() [base.py]
+│                       │     ├─→ knowledge_graph_inst.edge_degrees_batch() [base.py]
+│                       │     ├─→ _pack_single_community_by_sub_communitites() [graphrag.py]
+│                       │     │     └─→ truncate_list_by_token_size()  [utils.py]
+│                       │     ├─→ truncate_list_by_token_size()        [utils.py]
+│                       │     └─→ list_of_list_to_csv()                [utils.py]
+│                       │
+│                       ├─→ use_llm_func(prompt)      → best_model_func()  [llm.py]
+│                       ├─→ convert_response_to_json()                     [utils.py]
+│                       └─→ _community_report_json_to_str()                [utils.py]
+│
+├── [7] 持久化存储
+│     ├─→ self.full_docs.upsert()            → JsonKVStorage.upsert()  [base.py]
+│     └─→ self.text_chunks.upsert()          → JsonKVStorage.upsert()  [base.py]
+│
+└── [8] finally: self._insert_done()
+      └─→ asyncio.gather(*[storage.index_done_callback()])
+            ├─→ JsonKVStorage.index_done_callback()    [base.py] ← 写JSON文件
+            ├─→ VectorDBStorage.index_done_callback()  [base.py] ← 保存向量库
+            └─→ NetworkXStorage.index_done_callback()  [base.py] ← 写GraphML文件
+
+# ======================================================================================================
+构造graph--->
+      1. 加载的文本str转list
+      2. 调用mdhash为text生成唯一"doc-id"
+      3. 拿着“doc-id”去数据库比对去重
+      4. 对不在数据库中的text切块
+            (1). 对text进行encode编码
+            (2). 按照token_size切块
+      5. 对切块后的chunk调用mdhash生成"chunk-id"
+      6. 拿着"chunk-id"去数据库中比对去重
+      7. 对不在数据库中的chunk进调用LLM进行关系提取
+            (1). 写提示词prompt
+            (2). 将prompt+text文本内容合并成一个大的hint_prompt喂给LLM，得到result
+            (3). 将hint_prompt和result打包成标准的openai对话格式
+            (4). 根据提前设定的LLM提取次数，进行重复提取，榨取知识，得到final_result
+            (5). 对LLM输出的final_result进行处理，分别得到四元节点信息（entity_name, entity_type, description, source_id）和五元边关系（src_id, tgt_id, weight, description, source_id）
+            (6). 对上述得到的节点信息和边信息进一步处理，主要判断图中是否已经有该节点和边，如果没有插入，如果节点已经存在，则收集节点的(entity_type, description, source_id)然后将其与已有的合并；如果合并的description描述太长已经超过summary_max_tokens，则调用LLM生成新的摘要并更新；如果关系边已存在，则收集(weight, source_id, description, order)，其中order是使用DSpy进行实体提取时才会返回，在合并时候如果关系有order则取所有的最小值，如果没有，默认值为1.
+      8. 在得到新的实体关系后，使用leiden算法进行聚类
+      9. 生成最终的报告。
+            (1). 获取所有社区的schema信息，按照level从高到低排序。level越大，社区越小，粒度越细
+            (2). 先生成小社区报告，然后再生成大社区报告。并且大社区报告生成时可以引用已经生成好的小社区报告作为输入。
+            (3). 单个社区报告生成核心：
+                  (a). 从图存储中获取社区的所有节点和边数据
+                  (b). 按节点或者边的度数进行排序，保留重要的节点/边，并控制token的预算长度
+                  (c). 将上述打包好的描述加上提示词模板，调用LLM生成结构化json报告
+                  (d). json转为markdown格式的可读文本
+                  (e). 报告持久化存储到KV存储中 
+
+
+# -------------------------------------------------查询-------------------------------------------
+GraphRAG.aquery(query, param)
+├── param.mode == "global"
+│   └─→ global_query()                         [utils.py]
+│         ├─→ knowledge_graph_inst.community_schema()  [base.py]
+│         ├─→ community_reports.get_by_ids()           [base.py]
+│         │
+│         ├─→ _map_global_communities()         [utils.py]  ← Map阶段
+│         │     ├─→ truncate_list_by_token_size()        [utils.py]
+│         │     └─→ best_model_func()                    [llm.py]
+│         │
+│         └─→ best_model_func()                 [llm.py]  ← Reduce阶段
+
+
+查询
+      1. 获取社区并过滤，根据level只保留低于设定level的社区
+      2. 根据occurrence重要性进行降序排序，只取前k个社区
+      3. 获取社区报告并过滤
+      4. MapReduce阶段
+            (1). 
