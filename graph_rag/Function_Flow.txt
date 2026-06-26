@@ -152,7 +152,16 @@ GraphRAG.aquery(query, param)
 
 查询
       1. 获取社区并过滤，根据level只保留低于设定level的社区
-      2. 根据occurrence重要性进行降序排序，只取前k个社区
-      3. 获取社区报告并过滤
+      2. 根据occurrence（出现频次）重要性进行降序排序，只取前k个社区
+      3. 用社区的ID列表去KV存储中获取报告数据，并按照rating过滤，rating是社区重要度，之后再次根据(occurrence, rating)双关键字进行降序排序，确保最重要的社区排在最前面
       4. MapReduce阶段
-            (1). 
+            (1). 将社区报告分组，每组独立调用LLM提取与用户问题相关的关键点
+                  (a). 将社区报告按token预算切分成多个组，保证每个组的报告输入给LLM不会超过模型的上下文窗口
+            (2). 并行调用LLM输出
+                  (a). 将社区报告格式化为csv表格，有4列：id, content, rating, importance
+                  (b). 调用LLM输出json格式的points，包括description和score
+            (3). 返回结果是一个list， 即[[point1, point2], [..] ]
+            (4). Reduce阶段：
+                  (a). 过滤：丢弃没有descrptiond字段的point， 丢爹score<=0的point
+                  (b). 排序：按照score降序排序，最重要的point排在前面
+                  (c). 截断：控制输出的总token，防止LLM输出过长
